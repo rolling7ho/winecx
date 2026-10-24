@@ -1747,6 +1747,13 @@ static NSString* WineLocalizedString(unsigned int stringID)
         else
             window = (WineWindow*)[theEvent window];
 
+        /* The coasting a trackpad or Magic Mouse adds after the fingers lift
+           arrives as more scroll events. A game reads each one as a wheel
+           notch, so it keeps scrolling (switching weapons, zooming) after the
+           user stopped. */
+        if (!scroll_momentum && [theEvent momentumPhase] != NSEventPhaseNone)
+            return;
+
         if ([window isKindOfClass:[WineWindow class]])
         {
             CGEventRef cgevent = [theEvent CGEvent];

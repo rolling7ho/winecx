@@ -56,6 +56,7 @@ bool allow_immovable_windows = true;
 bool use_confinement_cursor_clipping = true;
 bool cursor_clipping_locks_windows = true;
 bool use_precise_scrolling = true;
+bool scroll_momentum = true;
 int gl_surface_mode = GL_SURFACE_IN_FRONT_OPAQUE;
 bool retina_enabled = false;
 bool enable_app_nap = false;
@@ -373,6 +374,9 @@ static void setup_options(void)
 
     if (!get_config_key(hkey, appkey, "UsePreciseScrolling", buffer, sizeof(buffer)))
         use_precise_scrolling = IS_OPTION_TRUE(buffer[0]);
+
+    if (!get_config_key(hkey, appkey, "ScrollMomentum", buffer, sizeof(buffer)))
+        scroll_momentum = IS_OPTION_TRUE(buffer[0]);
 
     if (!get_config_key(hkey, appkey, "OpenGLSurfaceMode", buffer, sizeof(buffer)))
     {
