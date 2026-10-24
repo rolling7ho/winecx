@@ -400,14 +400,15 @@ static BOOL install_present_hooks(void)
         return CGSizeMake(floor(size.width * scale + 0.5), floor(size.height * scale + 0.5));
     }
 
-    /* Called with the layer locked. */
-    - (void) updateUpscaling
+    /* Decides whether to upscale the game's size to target, and readies the
+     * scaler for it.  Touches only this object's own state, so it can run
+     * under its lock: Core Animation is asked nothing while that is held,
+     * since it may be calling into the layer from another thread. */
+    - (BOOL) prepareUpscaleTo:(CGSize)target format:(MTLPixelFormat)format device:(id<MTLDevice>)device
     {
-        CGSize target = [self targetSize];
-        BOOL upscale = metalfx_upscale && _gameSize.width >= 1 && _gameSize.height >= 1 &&
+        BOOL upscale = _gameSize.width >= 1 && _gameSize.height >= 1 &&
                        target.width > _gameSize.width * 1.1 && target.height > _gameSize.height * 1.1 &&
                        spatial_scaler_descriptor_class();
-        MTLPixelFormat format = self.pixelFormat;
         unsigned int i;
 
         if (upscale && !(_scaler && _scaler.inputWidth == _gameSize.width && _scaler.inputHeight == _gameSize.height &&
@@ -425,7 +426,7 @@ static BOOL install_present_hooks(void)
                                        MTLFXSpatialScalerColorProcessingModeHDR :
                                        MTLFXSpatialScalerColorProcessingModePerceptual;
             [_scaler release];
-            _scaler = [desc newSpatialScalerWithDevice:self.device];
+            _scaler = [desc newSpatialScalerWithDevice:device];
             [desc release];
             for (i = 0; i < 4; i++)
             {
@@ -438,39 +439,61 @@ static BOOL install_present_hooks(void)
                 [_residencySet commit];
             }
         }
-        upscale = upscale && _scaler && install_present_hooks();
+        return upscale && _scaler && install_present_hooks();
+    }
 
-        if (upscale != _upscaling)
+    /* Sets the drawables' size for a game asking for size, upscaled or not. */
+    - (void) applyGameSize:(CGSize)size
+    {
+        CGSize target = [self targetSize];
+        MTLPixelFormat format = self.pixelFormat;
+        id<MTLDevice> device = self.device;
+        BOOL upscale, was;
+
+        @synchronized(self)
+        {
+            _gameSize = size;
+            was = _upscaling;
+            upscale = _upscaling = [self prepareUpscaleTo:target format:format device:device];
+        }
+        if (upscale != was)
             NSLog(@"winemac: MetalFX upscaling %@ (%.0fx%.0f to %.0fx%.0f)", upscale ? @"on" : @"off",
-                  _gameSize.width, _gameSize.height, target.width, target.height);
+                  size.width, size.height, target.width, target.height);
         /* MetalFX writes the drawable from a shader. */
-        if (upscale && !_upscaling)
+        if (upscale && !was)
         {
             _framebufferOnly = self.framebufferOnly;
             self.framebufferOnly = NO;
         }
-        else if (!upscale && _upscaling)
+        else if (!upscale && was)
             self.framebufferOnly = _framebufferOnly;
-        _upscaling = upscale;
-        [super setDrawableSize:upscale ? target : _gameSize];
+        [super setDrawableSize:upscale ? target : size];
     }
 
+    /* Without the option, every method here is CAMetalLayer's own. */
     - (void) setDrawableSize:(CGSize)size
     {
-        @synchronized(self)
+        if (!metalfx_upscale)
         {
-            _gameSize = size;
-            [self updateUpscaling];
+            [super setDrawableSize:size];
+            return;
         }
+        [self applyGameSize:size];
     }
 
     - (void) setPixelFormat:(MTLPixelFormat)format
     {
+        CGSize size;
+        BOOL upscaling;
+
+        [super setPixelFormat:format];
+        if (!metalfx_upscale) return;
         @synchronized(self)
         {
-            [super setPixelFormat:format];
-            if (_upscaling) [self updateUpscaling];
+            size = _gameSize;
+            upscaling = _upscaling;
         }
+        if (upscaling) [self applyGameSize:size];
     }
 
     - (id<CAMetalDrawable>) realNextDrawable
@@ -480,15 +503,17 @@ static BOOL install_present_hooks(void)
 
     - (id<MTLCommandQueue>) fallbackQueue
     {
+        id<MTLDevice> device = self.device;
         @synchronized(self)
         {
-            if (!_fallbackQueue) _fallbackQueue = [self.device newCommandQueue];
+            if (!_fallbackQueue) _fallbackQueue = [device newCommandQueue];
             return _fallbackQueue;
         }
     }
 
     - (void) addUpscaleResidencyToQueue:(id)queue
     {
+        id<MTLDevice> device = self.device;
         @synchronized(self)
         {
             unsigned int i;
@@ -496,7 +521,7 @@ static BOOL install_present_hooks(void)
             {
                 MTLResidencySetDescriptor *desc = [[MTLResidencySetDescriptor alloc] init];
                 desc.label = @"Wine MetalFX upscale";
-                _residencySet = [self.device newResidencySetWithDescriptor:desc error:nil];
+                _residencySet = [device newResidencySetWithDescriptor:desc error:nil];
                 [desc release];
                 if (!_residencySet) return;
                 for (i = 0; i < 4; i++)
@@ -513,9 +538,10 @@ static BOOL install_present_hooks(void)
 
     - (id<MTLEvent>) renderedEvent:(uint64_t*)value
     {
+        id<MTLDevice> device = self.device;
         @synchronized(self)
         {
-            if (!_renderedEvent) _renderedEvent = [self.device newEvent];
+            if (!_renderedEvent) _renderedEvent = [device newEvent];
             *value = ++_renderedValue;
             return _renderedEvent;
         }
@@ -524,25 +550,28 @@ static BOOL install_present_hooks(void)
     /* A stand-in drawable at the game's size, or nil when not upscaling. */
     - (id<CAMetalDrawable>) upscaleDrawable
     {
+        MTLPixelFormat format = self.pixelFormat;
+        id<MTLDevice> device = self.device;
+
         @synchronized(self)
         {
             id<MTLTexture> texture;
 
             /* A window resized without a new swapchain size keeps its last
              * upscale, which Core Animation then stretches. */
-            if (!_upscaling || self.pixelFormat != _scaler.colorTextureFormat) return nil;
+            if (!_upscaling || format != _scaler.colorTextureFormat) return nil;
 
             if (!(texture = _textures[_nextTexture]))
             {
                 MTLTextureDescriptor *desc = [MTLTextureDescriptor
-                    texture2DDescriptorWithPixelFormat:self.pixelFormat
+                    texture2DDescriptorWithPixelFormat:format
                                                  width:_gameSize.width
                                                 height:_gameSize.height
                                              mipmapped:NO];
                 desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
                              MTLTextureUsageShaderWrite | _scaler.colorTextureUsage;
                 desc.storageMode = MTLStorageModePrivate;
-                texture = _textures[_nextTexture] = [self.device newTextureWithDescriptor:desc];
+                texture = _textures[_nextTexture] = [device newTextureWithDescriptor:desc];
                 if (_residencySet && texture)
                 {
                     [_residencySet addAllocation:texture];
@@ -586,7 +615,7 @@ static BOOL install_present_hooks(void)
             }
         }
 
-        id<CAMetalDrawable> upscale = [self upscaleDrawable];
+        id<CAMetalDrawable> upscale = metalfx_upscale ? [self upscaleDrawable] : nil;
         return upscale ? upscale : [super nextDrawable];
     }
 
