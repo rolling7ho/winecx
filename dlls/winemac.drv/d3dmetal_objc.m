@@ -69,15 +69,21 @@ static Class spatial_scaler_descriptor_class(void)
     NSUInteger _drawableID;
     id<CAMetalDrawable> _drawable;
     NSMutableArray* _presentedHandlers;
+    id<MTLEvent> _renderedEvent;
+    uint64_t _renderedValue;
 }
     - (instancetype) initWithLayer:(WineMetalLayer*)layer texture:(id<MTLTexture>)texture
                             scaler:(id<MTLFXSpatialScaler>)scaler drawableID:(NSUInteger)drawableID;
     - (id<CAMetalDrawable>) upscaleInCommandBuffer:(id<MTLCommandBuffer>)commandBuffer;
+    - (void) makeResidentForQueue:(id)queue;
+    - (void) signalRenderedOnQueue:(id)queue;
 @end
 
 @interface WineMetalLayer ()
     - (id<CAMetalDrawable>) realNextDrawable;
     - (id<MTLCommandQueue>) fallbackQueue;
+    - (void) addUpscaleResidencyToQueue:(id)queue;
+    - (id<MTLEvent>) renderedEvent:(uint64_t*)value;
 @end
 
 @implementation WineUpscaleDrawable
@@ -103,6 +109,7 @@ static Class spatial_scaler_descriptor_class(void)
         [_scaler release];
         [_drawable release];
         [_presentedHandlers release];
+        [_renderedEvent release];
         [super dealloc];
     }
 
@@ -130,21 +137,69 @@ static Class spatial_scaler_descriptor_class(void)
         [_drawable addPresentedHandler:^(id<MTLDrawable> drawable) { block(self); }];
     }
 
-    /* Takes the layer's real drawable and encodes the upscale into it. */
-    - (id<CAMetalDrawable>) upscaleInCommandBuffer:(id<MTLCommandBuffer>)commandBuffer
+    /* The layer's real drawable, taken the first time it is needed. */
+    - (id<CAMetalDrawable>) realDrawable
     {
-        id<CAMetalDrawable> drawable = [_layer realNextDrawable];
-        id<MTLTexture> output = drawable.texture;
+        id<CAMetalDrawable> drawable;
         NSArray* handlers;
-        if (!drawable) return nil;
+
         @synchronized(self)
         {
+            if (_drawable) return _drawable;
+        }
+        if (!(drawable = [_layer realNextDrawable])) return nil;
+        @synchronized(self)
+        {
+            if (_drawable) return _drawable;
             _drawable = [drawable retain];
             handlers = [_presentedHandlers autorelease];
             _presentedHandlers = nil;
         }
         for (MTLDrawablePresentedHandler block in handlers)
             [drawable addPresentedHandler:^(id<MTLDrawable> real) { block(self); }];
+        return drawable;
+    }
+
+    /* Anything else a drawable is asked goes to the real one. */
+    - (id) forwardingTargetForSelector:(SEL)sel
+    {
+        static BOOL logged;
+        if (!logged)
+        {
+            logged = YES;
+            NSLog(@"winemac: MetalFX stand-in drawable forwarding %@", NSStringFromSelector(sel));
+        }
+        return [self realDrawable];
+    }
+
+    /* A Metal 4 queue only reaches resources in its residency sets. */
+    - (void) makeResidentForQueue:(id)queue
+    {
+        [_layer addUpscaleResidencyToQueue:queue];
+    }
+
+    /* A Metal 4 queue's frame is done with the stand-in once the queue gets
+     * past this point; the upscale, on another queue, waits for it. */
+    - (void) signalRenderedOnQueue:(id)queue
+    {
+        uint64_t value;
+        id<MTLEvent> event = [_layer renderedEvent:&value];
+        if (!event) return;
+        [queue signalEvent:event value:value];
+        @synchronized(self)
+        {
+            [_renderedEvent release];
+            _renderedEvent = [event retain];
+            _renderedValue = value;
+        }
+    }
+
+    /* Takes the layer's real drawable and encodes the upscale into it. */
+    - (id<CAMetalDrawable>) upscaleInCommandBuffer:(id<MTLCommandBuffer>)commandBuffer
+    {
+        id<CAMetalDrawable> drawable = [self realDrawable];
+        id<MTLTexture> output = drawable.texture;
+        if (!drawable) return nil;
         if (output.width == _scaler.outputWidth && output.height == _scaler.outputHeight)
         {
             _scaler.colorTexture = _texture;
@@ -156,14 +211,18 @@ static Class spatial_scaler_descriptor_class(void)
         return drawable;
     }
 
-    /* Presenting without a command buffer: the game's rendering was committed
-     * to its own queue before this, so the upscale is ordered after it only as
-     * far as Metal tracks the texture.  D3DMetal presents through its command
-     * buffers, so this is a fallback. */
+    /* Presenting the drawable itself, as D3DMetal does with a Metal 4 queue:
+     * the upscale goes in a command buffer of the layer's own, which waits for
+     * the game's queue to signal it is done with the frame. */
     - (void) presentWithCommandBuffer:(void (^)(id<MTLCommandBuffer>, id<CAMetalDrawable>))present
     {
         id<MTLCommandBuffer> commandBuffer = [[_layer fallbackQueue] commandBuffer];
-        id<CAMetalDrawable> drawable = [self upscaleInCommandBuffer:commandBuffer];
+        id<CAMetalDrawable> drawable;
+        @synchronized(self)
+        {
+            if (_renderedEvent) [commandBuffer encodeWaitForEvent:_renderedEvent value:_renderedValue];
+        }
+        drawable = [self upscaleInCommandBuffer:commandBuffer];
         if (drawable) present(commandBuffer, drawable);
         [commandBuffer commit];
     }
@@ -238,6 +297,36 @@ static void hook_present_with_time(Class cls, SEL sel)
     }
 }
 
+/* A Metal 4 queue waits for and signals the drawable itself.  The stand-in
+ * needs no waiting (the real drawable is waited for when it is presented),
+ * and its signal becomes the event the upscale waits for. */
+static void hook_queue(Class cls)
+{
+    SEL wait = @selector(waitForDrawable:), signal = @selector(signalDrawable:);
+    if (class_defines(cls, wait))
+    {
+        Method method = class_getInstanceMethod(cls, wait);
+        void (*orig)(id, SEL, id) = (void *)method_getImplementation(method);
+        method_setImplementation(method, imp_implementationWithBlock(^(id queue, id drawable) {
+            if ([drawable isKindOfClass:[WineUpscaleDrawable class]])
+                [(WineUpscaleDrawable*)drawable makeResidentForQueue:queue];
+            else
+                orig(queue, wait, drawable);
+        }));
+    }
+    if (class_defines(cls, signal))
+    {
+        Method method = class_getInstanceMethod(cls, signal);
+        void (*orig)(id, SEL, id) = (void *)method_getImplementation(method);
+        method_setImplementation(method, imp_implementationWithBlock(^(id queue, id drawable) {
+            if ([drawable isKindOfClass:[WineUpscaleDrawable class]])
+                [(WineUpscaleDrawable*)drawable signalRenderedOnQueue:queue];
+            else
+                orig(queue, signal, drawable);
+        }));
+    }
+}
+
 /* Every command buffer class that defines a present method itself: the
  * device's command buffers come in more than one class (plain, unretained
  * references, the validation layer's), and which D3DMetal gets cannot be
@@ -253,6 +342,12 @@ static BOOL install_present_hooks(void)
         for (i = 0; i < count; i++)
         {
             Class cls = classes[i];
+            if (strstr(class_getName(cls), "CommandQueue") &&
+                (class_defines(cls, @selector(waitForDrawable:)) || class_defines(cls, @selector(signalDrawable:))))
+            {
+                hook_queue(cls);
+                continue;
+            }
             if (!strstr(class_getName(cls), "CommandBuffer") || !class_respondsToSelector(cls, @selector(commit)))
                 continue;
             if (!class_defines(cls, @selector(presentDrawable:)) &&
@@ -279,6 +374,10 @@ static BOOL install_present_hooks(void)
     id<MTLTexture> _textures[4];
     NSUInteger _nextTexture;
     id<MTLCommandQueue> _fallbackQueue;
+    id<MTLResidencySet> _residencySet;
+    NSMutableSet* _residentQueues;
+    id<MTLEvent> _renderedEvent;
+    uint64_t _renderedValue;
 }
 
     - (void) dealloc
@@ -287,6 +386,9 @@ static BOOL install_present_hooks(void)
         [_scaler release];
         for (i = 0; i < 4; i++) [_textures[i] release];
         [_fallbackQueue release];
+        [_residencySet release];
+        [_residentQueues release];
+        [_renderedEvent release];
         [super dealloc];
     }
 
@@ -329,6 +431,11 @@ static BOOL install_present_hooks(void)
             {
                 [_textures[i] release];
                 _textures[i] = nil;
+            }
+            if (_residencySet)
+            {
+                [_residencySet removeAllAllocations];
+                [_residencySet commit];
             }
         }
         upscale = upscale && _scaler && install_present_hooks();
@@ -380,6 +487,40 @@ static BOOL install_present_hooks(void)
         }
     }
 
+    - (void) addUpscaleResidencyToQueue:(id)queue
+    {
+        @synchronized(self)
+        {
+            unsigned int i;
+            if (!_residencySet)
+            {
+                MTLResidencySetDescriptor *desc = [[MTLResidencySetDescriptor alloc] init];
+                desc.label = @"Wine MetalFX upscale";
+                _residencySet = [self.device newResidencySetWithDescriptor:desc error:nil];
+                [desc release];
+                if (!_residencySet) return;
+                for (i = 0; i < 4; i++)
+                    if (_textures[i]) [_residencySet addAllocation:_textures[i]];
+                [_residencySet commit];
+                [_residencySet requestResidency];
+                _residentQueues = [[NSMutableSet alloc] init];
+            }
+            if ([_residentQueues containsObject:[NSValue valueWithNonretainedObject:queue]]) return;
+            [_residentQueues addObject:[NSValue valueWithNonretainedObject:queue]];
+            [queue addResidencySet:_residencySet];
+        }
+    }
+
+    - (id<MTLEvent>) renderedEvent:(uint64_t*)value
+    {
+        @synchronized(self)
+        {
+            if (!_renderedEvent) _renderedEvent = [self.device newEvent];
+            *value = ++_renderedValue;
+            return _renderedEvent;
+        }
+    }
+
     /* A stand-in drawable at the game's size, or nil when not upscaling. */
     - (id<CAMetalDrawable>) upscaleDrawable
     {
@@ -402,6 +543,11 @@ static BOOL install_present_hooks(void)
                              MTLTextureUsageShaderWrite | _scaler.colorTextureUsage;
                 desc.storageMode = MTLStorageModePrivate;
                 texture = _textures[_nextTexture] = [self.device newTextureWithDescriptor:desc];
+                if (_residencySet && texture)
+                {
+                    [_residencySet addAllocation:texture];
+                    [_residencySet commit];
+                }
             }
             _nextTexture = (_nextTexture + 1) % 4;
             return [[[WineUpscaleDrawable alloc] initWithLayer:self texture:texture scaler:_scaler
