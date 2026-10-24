@@ -3985,6 +3985,11 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
     c.bounds = CGRectMake(0, 0, CGRectGetWidth(container), CGRectGetHeight(container));
+    /* The rects are Win32 coordinates, which are pixels in retina mode, and
+     * the swapchain is sized to match; the hosting window is in points.  Keep
+     * the rendering side in pixels and show the published tree at half size,
+     * or the host shows its top-left quarter magnified. */
+    c.transform = retina_on ? CATransform3DMakeScale(0.5, 0.5, 1) : CATransform3DIdentity;
     o.anchorPoint = CGPointMake(0, 0);
     o.bounds = CGRectMake(0, 0, CGRectGetWidth(frame), CGRectGetHeight(frame));
     o.position = CGPointMake(CGRectGetMinX(frame), CGRectGetMinY(frame));
