@@ -29,6 +29,10 @@
  * without this they would all show the bundle's name.  Main thread only. */
 static NSString* application_name;
 
+/* Display reconfigurations macOS has reported, and one more than the count at
+ * the last activation's resync (zero before the first).  Main thread only. */
+static unsigned int display_reconfigurations, synced_display_reconfigurations;
+
 #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
 
 
@@ -2450,6 +2454,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
         NSDictionary *userInfo;
 
         primaryScreenHeightValid = FALSE;
+        display_reconfigurations++;
         [self sendDisplaysChanged:FALSE];
         [self adjustWindowLevels];
 
@@ -2516,7 +2521,17 @@ static NSString* WineLocalizedString(unsigned int stringID)
         // To solve this, we synthesize a displays-changed event whenever we're
         // activated.  This will provoke a re-synchronization of Wine's notion of
         // the desktop rect with the actual state.
-        [self sendDisplaysChanged:TRUE];
+        //
+        // Only when a display was reconfigured since the last one, though: the
+        // activated process handles it on whichever of its threads looks first,
+        // often a game's render thread, and re-reading every display and GPU
+        // there freezes the game for up to a second.  A game whose clicks
+        // briefly hand focus elsewhere and back paid that on every click.
+        if (!synced_display_reconfigurations || synced_display_reconfigurations != display_reconfigurations + 1)
+        {
+            synced_display_reconfigurations = display_reconfigurations + 1;
+            [self sendDisplaysChanged:TRUE];
+        }
 
         // The cursor probably moved while we were inactive.  Accumulated mouse
         // movement deltas are invalidated.  Make sure the next mouse move event
