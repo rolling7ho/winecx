@@ -4279,6 +4279,13 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
     o.bounds = CGRectMake(0, 0, CGRectGetWidth(frame), CGRectGetHeight(frame));
     o.position = CGPointMake(CGRectGetMinX(frame), CGRectGetMinY(frame));
     [CATransaction commit];
+
+    /* This runs on the presenting thread, which has no run loop.  Its
+     * CAMetalLayer calls leave an implicit transaction open that nothing
+     * commits, and the one above nests inside it, so without a flush the
+     * published tree keeps the size it was created at (Steam's menus are
+     * created at 2x1 and stay blank). */
+    [CATransaction flush];
 }
 
 - (CAMetalLayer*) layer
