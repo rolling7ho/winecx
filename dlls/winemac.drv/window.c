@@ -45,6 +45,10 @@ static CFMutableDictionaryRef win_datas;
 
 static unsigned int activate_on_focus_time;
 
+/* The window whose title names the application, once one has. */
+static HWND app_name_window;
+static void update_app_name(HWND hwnd, const WCHAR *text, BOOL shown);
+
 
 /* CrossOver Hack #16933 */
 static BOOL is_main_quicken_window(HWND hwnd)
@@ -522,6 +526,7 @@ static void create_cocoa_window(struct macdrv_win_data *data)
     /* set the window text */
     if (!NtUserInternalGetWindowText(data->hwnd, text, ARRAY_SIZE(text))) text[0] = 0;
     macdrv_set_cocoa_window_title(data->cocoa_window, text, wcslen(text));
+    update_app_name(data->hwnd, text, FALSE);
 
     /* set the window region */
     if (win_rgn || IsRectEmpty(&data->rects.window)) sync_window_region(data, win_rgn);
@@ -694,6 +699,14 @@ static void show_window(struct macdrv_win_data *data)
         set_focus(info.hwndFocus, FALSE);
     if (activate)
         activate_on_focus_time = 0;
+
+    if (data->hwnd != app_name_window)
+    {
+        WCHAR text[1024];
+
+        if (!NtUserInternalGetWindowText(data->hwnd, text, ARRAY_SIZE(text))) text[0] = 0;
+        update_app_name(data->hwnd, text, TRUE);
+    }
 }
 
 
@@ -907,6 +920,95 @@ static void set_app_icon(void)
             }
         }
     }
+}
+
+
+static BOOL app_named_by_host;
+
+static void set_app_name(const WCHAR *name, size_t len)
+{
+    CFStringRef str = CFStringCreateWithCharacters(NULL, (const UniChar *)name, len);
+
+    if (!str) return;
+    macdrv_set_application_name(str);
+    CFRelease(str);
+}
+
+
+/**********************************************************************
+ *              set_default_app_name
+ *
+ * Every process runs from the same bundle, which would otherwise name them
+ * all.  A name the host passed for this exe wins; else the exe's file name
+ * does until a window's title replaces it.
+ */
+static void set_default_app_name(void)
+{
+    const WCHAR *image = RtlGetCurrentPeb()->ProcessParameters->ImagePathName.Buffer;
+    const char *name = getenv("WINE_APP_DISPLAY_NAME"), *owner = getenv("WINE_APP_IDENTITY_EXE");
+    WCHAR buf[256];
+    const WCHAR *p, *end;
+    size_t len;
+
+    if (name && name[0] && (!owner || !owner[0] || running_image_is(owner)))
+    {
+        CFStringRef str = CFStringCreateWithCString(NULL, name, kCFStringEncodingUTF8);
+        if (str)
+        {
+            macdrv_set_application_name(str);
+            CFRelease(str);
+            app_named_by_host = TRUE;
+            return;
+        }
+    }
+
+    if (!image) return;
+    if ((p = wcsrchr(image, '/'))) image = p + 1;
+    if ((p = wcsrchr(image, '\\'))) image = p + 1;
+    if (!(end = wcsrchr(image, '.')) || end == image) end = image + wcslen(image);
+    if (!(len = min(end - image, ARRAY_SIZE(buf)))) return;
+    memcpy(buf, image, len * sizeof(WCHAR));
+    if (buf[0] >= 'a' && buf[0] <= 'z') buf[0] += 'A' - 'a';
+    set_app_name(buf, len);
+}
+
+
+/**********************************************************************
+ *              is_main_window
+ *
+ * Whether a window is one people would know the program by: visible,
+ * unowned, top-level and not a tool window.
+ */
+static BOOL is_main_window(HWND hwnd)
+{
+    if (!(NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_VISIBLE)) return FALSE;
+    if (NtUserGetAncestor(hwnd, GA_PARENT) != NtUserGetDesktopWindow()) return FALSE;
+    if (NtUserGetWindowRelative(hwnd, GW_OWNER)) return FALSE;
+    return !(NtUserGetWindowLongW(hwnd, GWL_EXSTYLE) & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE));
+}
+
+
+/**********************************************************************
+ *              update_app_name
+ *
+ * Names the application after the main window shown last, and follows that
+ * window's title.  The exe's name is often an internal one (Steam draws its
+ * client in steamwebhelper.exe), and the first window can be a passing one
+ * (Steam's sign-in), so neither is enough on its own.
+ */
+static void update_app_name(HWND hwnd, const WCHAR *text, BOOL shown)
+{
+    static pthread_once_t default_name_once = PTHREAD_ONCE_INIT;
+
+    pthread_once(&default_name_once, set_default_app_name);
+    if (app_named_by_host || !text || !text[0]) return;
+
+    if (hwnd != app_name_window)
+    {
+        if ((!shown && app_name_window) || !is_main_window(hwnd)) return;
+        app_name_window = hwnd;
+    }
+    set_app_name(text, wcslen(text));
 }
 
 
@@ -1611,7 +1713,10 @@ void macdrv_SetWindowText(HWND hwnd, LPCWSTR text)
     TRACE("%p, %s\n", hwnd, debugstr_w(text));
 
     if ((win = macdrv_get_cocoa_window(hwnd, FALSE)))
+    {
         macdrv_set_cocoa_window_title(win, text, wcslen(text));
+        update_app_name(hwnd, text, FALSE);
+    }
 }
 
 

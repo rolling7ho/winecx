@@ -18,11 +18,16 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
+#include <dlfcn.h>
 #import "cocoa_app.h"
 #import "cocoa_cursorclipping.h"
 #import "cocoa_event.h"
 #import "cocoa_window.h"
 #import "cocoa_icon_utils.h"
+
+/* The name the menu bar shows.  Every process runs from the one bundle, so
+ * without this they would all show the bundle's name.  Main thread only. */
+static NSString* application_name;
 
 #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
 
@@ -341,7 +346,9 @@ static NSString* WineLocalizedString(unsigned int stringID)
 
             // Application menu
             submenu = [[[NSMenu alloc] initWithTitle:WineLocalizedString(STRING_MENU_WINE)] autorelease];
-            bundleName = [[NSBundle mainBundle] objectForInfoDictionaryKey:(NSString*)kCFBundleNameKey];
+            bundleName = application_name;
+            if (![bundleName length])
+                bundleName = [[NSBundle mainBundle] objectForInfoDictionaryKey:(NSString*)kCFBundleNameKey];
 
             if ([bundleName length])
                 title = [NSString stringWithFormat:WineLocalizedString(STRING_MENU_ITEM_HIDE_APPNAME), bundleName];
@@ -2937,6 +2944,60 @@ void macdrv_set_application_icon(CFArrayRef images, CFURLRef urlRef)
             controller.applicationIcon = image;
         else
             [controller setApplicationIconFromCGImageArray:imageArray];
+    });
+}
+
+/* Launch Services owns the name the menu bar and the app switcher show, and
+ * only takes a change through its private SPI (what Chromium uses to name its
+ * helpers).  Looked up at run time so a missing symbol costs only the name. */
+static void set_launch_services_display_name(NSString* name)
+{
+    typedef CFTypeRef (*get_asn_func)(void);
+    typedef OSStatus (*set_item_func)(int, CFTypeRef, CFStringRef, CFStringRef, CFDictionaryRef*);
+    static get_asn_func get_asn;
+    static set_item_func set_item;
+    static CFStringRef* display_name_key;
+    static dispatch_once_t once;
+    CFTypeRef asn;
+
+    dispatch_once(&once, ^{
+        void* ls = dlopen("/System/Library/Frameworks/CoreServices.framework/Frameworks/"
+                          "LaunchServices.framework/LaunchServices", RTLD_LAZY);
+        if (!ls) return;
+        get_asn = (get_asn_func)dlsym(ls, "_LSGetCurrentApplicationASN");
+        set_item = (set_item_func)dlsym(ls, "_LSSetApplicationInformationItem");
+        display_name_key = (CFStringRef*)dlsym(ls, "_kLSDisplayNameKey");
+    });
+    if (!get_asn || !set_item || !display_name_key || !*display_name_key) return;
+    if ((asn = get_asn()))
+        set_item(-2 /* kLSDefaultSessionID */, asn, *display_name_key, (CFStringRef)name, NULL);
+}
+
+/***********************************************************************
+ *              macdrv_set_application_name
+ *
+ * Names the application in the menu bar, the Dock and the app switcher.
+ */
+void macdrv_set_application_name(CFStringRef nameRef)
+{
+    NSString* name = [[(NSString*)nameRef copy] autorelease];
+
+    OnMainThreadAsync(^{
+        NSMenu* appMenu;
+
+        if (![name length] || [name isEqualToString:application_name]) return;
+        [application_name release];
+        application_name = [name retain];
+        set_launch_services_display_name(name);
+
+        appMenu = [[[NSApp mainMenu] itemAtIndex:0] submenu];
+        for (NSMenuItem* item in [appMenu itemArray])
+        {
+            if ([item action] == @selector(hide:))
+                [item setTitle:[NSString stringWithFormat:WineLocalizedString(STRING_MENU_ITEM_HIDE_APPNAME), name]];
+            else if ([item action] == @selector(terminate:))
+                [item setTitle:[NSString stringWithFormat:WineLocalizedString(STRING_MENU_ITEM_QUIT_APPNAME), name]];
+        }
     });
 }
 

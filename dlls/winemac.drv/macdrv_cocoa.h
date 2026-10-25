@@ -225,6 +225,7 @@ extern int macdrv_start_cocoa_app(unsigned long long tickcount);
 extern void macdrv_window_rejected_focus(const struct macdrv_event *event);
 extern void macdrv_beep(void);
 extern void macdrv_set_application_icon(CFArrayRef images, CFURLRef url /* CrossOver Hack 13440 */);
+extern void macdrv_set_application_name(CFStringRef name);
 extern void macdrv_quit_reply(int reply);
 extern bool macdrv_using_input_method(void);
 extern void macdrv_set_mouse_capture_window(macdrv_window window);
