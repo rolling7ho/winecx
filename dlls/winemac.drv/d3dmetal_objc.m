@@ -61,6 +61,109 @@ static Class spatial_scaler_descriptor_class(void)
     return cls;
 }
 
+/* With the "UpscaleSharpness" option, MetalFX upscales into a texture of the
+ * window's size, and a pass of RCAS (the robust contrast-adaptive sharpening
+ * of AMD FidelityFX Super Resolution 1, which is MIT licensed) draws that into
+ * the drawable, giving back the edge contrast an upscale softens.  MetalFX's
+ * spatial scaler has no sharpening of its own.  RCAS expects values from 0 to
+ * 1, so frames in a floating-point format are not sharpened. */
+static const char rcas_source[] =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "struct V { float4 position [[position]]; };\n"
+    "vertex V wine_rcas_vertex(uint vid [[vertex_id]])\n"
+    "{\n"
+    "    V out;\n"
+    "    float2 uv = float2((vid << 1) & 2, vid & 2);\n"
+    "    out.position = float4(uv * 2.0 - 1.0, 0.0, 1.0);\n"
+    "    return out;\n"
+    "}\n"
+    "fragment float4 wine_rcas_fragment(V in [[stage_in]], texture2d<float, access::read> image [[texture(0)]],\n"
+    "                                   constant float& sharpness [[buffer(0)]])\n"
+    "{\n"
+    "    int2 p = int2(in.position.xy), last = int2(image.get_width() - 1, image.get_height() - 1);\n"
+    "    float4 e = image.read(uint2(p));\n"
+    "    float3 b = image.read(uint2(clamp(p + int2(0, -1), int2(0), last))).rgb;\n"
+    "    float3 d = image.read(uint2(clamp(p + int2(-1, 0), int2(0), last))).rgb;\n"
+    "    float3 f = image.read(uint2(clamp(p + int2(1, 0), int2(0), last))).rgb;\n"
+    "    float3 h = image.read(uint2(clamp(p + int2(0, 1), int2(0), last))).rgb;\n"
+    "    float bL = b.b * 0.5 + (b.r * 0.5 + b.g), dL = d.b * 0.5 + (d.r * 0.5 + d.g);\n"
+    "    float eL = e.b * 0.5 + (e.r * 0.5 + e.g), fL = f.b * 0.5 + (f.r * 0.5 + f.g);\n"
+    "    float hL = h.b * 0.5 + (h.r * 0.5 + h.g);\n"
+    "    float nz = 0.25 * (bL + dL + fL + hL) - eL;\n"
+    "    float range = max(max(max(bL, dL), max(eL, fL)), hL) - min(min(min(bL, dL), min(eL, fL)), hL);\n"
+    "    nz = -0.5 * saturate(abs(nz) / max(range, 1.0e-5)) + 1.0;\n"
+    "    float3 mn4 = min(min(b, d), min(f, h)), mx4 = max(max(b, d), max(f, h));\n"
+    "    float3 hitMin = mn4 / max(4.0 * mx4, 1.0e-5);\n"
+    "    float3 hitMax = (1.0 - mx4) / min(4.0 * mn4 - 4.0, -1.0e-5);\n"
+    "    float3 lobeRGB = max(-hitMin, hitMax);\n"
+    "    float lobe = max(-(0.25 - 1.0 / 16.0), min(max(lobeRGB.r, max(lobeRGB.g, lobeRGB.b)), 0.0)) * sharpness * nz;\n"
+    "    return float4((lobe * (b + d + f + h) + e.rgb) / (4.0 * lobe + 1.0), e.a);\n"
+    "}\n";
+
+static BOOL format_takes_sharpening(MTLPixelFormat format)
+{
+    switch (format)
+    {
+        case MTLPixelFormatBGRA8Unorm:
+        case MTLPixelFormatBGRA8Unorm_sRGB:
+        case MTLPixelFormatRGBA8Unorm:
+        case MTLPixelFormatRGBA8Unorm_sRGB:
+        case MTLPixelFormatBGR10A2Unorm:
+        case MTLPixelFormatRGB10A2Unorm:
+            return YES;
+        default:
+            return NO;
+    }
+}
+
+/* The sharpening pass drawing into drawables of format, built once. */
+static id<MTLRenderPipelineState> sharpen_pipeline(id<MTLDevice> device, MTLPixelFormat format)
+{
+    static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+    static NSMutableDictionary* pipelines;
+    static NSMutableSet* failed;
+    NSString* key = [NSString stringWithFormat:@"%llu/%lu", device.registryID, (unsigned long)format];
+    id<MTLRenderPipelineState> pipeline;
+
+    if (!format_takes_sharpening(format)) return nil;
+    pthread_mutex_lock(&mutex);
+    if (!pipelines)
+    {
+        pipelines = [[NSMutableDictionary alloc] init];
+        failed = [[NSMutableSet alloc] init];
+    }
+    if (!(pipeline = pipelines[key]) && ![failed containsObject:key])
+    {
+        NSError* error = nil;
+        id<MTLLibrary> library = [device newLibraryWithSource:@(rcas_source) options:nil error:&error];
+        MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
+        id<MTLFunction> vertex = [library newFunctionWithName:@"wine_rcas_vertex"];
+        id<MTLFunction> fragment = [library newFunctionWithName:@"wine_rcas_fragment"];
+        desc.label = @"Wine RCAS sharpening";
+        desc.vertexFunction = vertex;
+        desc.fragmentFunction = fragment;
+        desc.colorAttachments[0].pixelFormat = format;
+        if (vertex && fragment) pipeline = [device newRenderPipelineStateWithDescriptor:desc error:&error];
+        if (pipeline)
+        {
+            pipelines[key] = pipeline;
+            [pipeline release];
+        }
+        else
+        {
+            [failed addObject:key];
+            NSLog(@"winemac: no RCAS sharpening: %@", error);
+        }
+        [vertex release];
+        [fragment release];
+        [desc release];
+        [library release];
+    }
+    pthread_mutex_unlock(&mutex);
+    return pipeline;
+}
+
 @interface WineUpscaleDrawable : NSObject <CAMetalDrawable>
 {
     WineMetalLayer* _layer;
@@ -71,9 +174,14 @@ static Class spatial_scaler_descriptor_class(void)
     NSMutableArray* _presentedHandlers;
     id<MTLEvent> _renderedEvent;
     uint64_t _renderedValue;
+    id<MTLTexture> _upscaled;
+    id<MTLRenderPipelineState> _sharpen;
+    float _sharpness;
 }
     - (instancetype) initWithLayer:(WineMetalLayer*)layer texture:(id<MTLTexture>)texture
                             scaler:(id<MTLFXSpatialScaler>)scaler drawableID:(NSUInteger)drawableID;
+    - (void) sharpenInto:(id<MTLTexture>)upscaled with:(id<MTLRenderPipelineState>)pipeline
+               sharpness:(float)sharpness;
     - (id<CAMetalDrawable>) upscaleInCommandBuffer:(id<MTLCommandBuffer>)commandBuffer;
     - (void) makeResidentForQueue:(id)queue;
     - (void) signalRenderedOnQueue:(id)queue;
@@ -110,7 +218,18 @@ static Class spatial_scaler_descriptor_class(void)
         [_drawable release];
         [_presentedHandlers release];
         [_renderedEvent release];
+        [_upscaled release];
+        [_sharpen release];
         [super dealloc];
+    }
+
+    /* The upscale goes to upscaled, and pipeline sharpens it into the drawable. */
+    - (void) sharpenInto:(id<MTLTexture>)upscaled with:(id<MTLRenderPipelineState>)pipeline
+               sharpness:(float)sharpness
+    {
+        _upscaled = [upscaled retain];
+        _sharpen = [pipeline retain];
+        _sharpness = sharpness;
     }
 
     - (id<MTLTexture>) texture { return _texture; }
@@ -202,11 +321,27 @@ static Class spatial_scaler_descriptor_class(void)
         if (!drawable) return nil;
         if (output.width == _scaler.outputWidth && output.height == _scaler.outputHeight)
         {
+            BOOL sharpen = _upscaled && _sharpen && _upscaled.width == output.width &&
+                           _upscaled.height == output.height && _upscaled.pixelFormat == output.pixelFormat;
             _scaler.colorTexture = _texture;
-            _scaler.outputTexture = output;
+            _scaler.outputTexture = sharpen ? _upscaled : output;
             _scaler.inputContentWidth = _texture.width;
             _scaler.inputContentHeight = _texture.height;
             [_scaler encodeToCommandBuffer:commandBuffer];
+            if (sharpen)
+            {
+                MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+                id<MTLRenderCommandEncoder> encoder;
+                pass.colorAttachments[0].texture = output;
+                pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+                pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+                encoder = [commandBuffer renderCommandEncoderWithDescriptor:pass];
+                [encoder setRenderPipelineState:_sharpen];
+                [encoder setFragmentTexture:_upscaled atIndex:0];
+                [encoder setFragmentBytes:&_sharpness length:sizeof(_sharpness) atIndex:0];
+                [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+                [encoder endEncoding];
+            }
         }
         return drawable;
     }
@@ -372,6 +507,8 @@ static BOOL install_present_hooks(void)
     BOOL _framebufferOnly;
     id<MTLFXSpatialScaler> _scaler;
     id<MTLTexture> _textures[4];
+    id<MTLTexture> _upscaled[4];
+    id<MTLRenderPipelineState> _sharpen;
     NSUInteger _nextTexture;
     id<MTLCommandQueue> _fallbackQueue;
     id<MTLResidencySet> _residencySet;
@@ -384,7 +521,12 @@ static BOOL install_present_hooks(void)
     {
         unsigned int i;
         [_scaler release];
-        for (i = 0; i < 4; i++) [_textures[i] release];
+        for (i = 0; i < 4; i++)
+        {
+            [_textures[i] release];
+            [_upscaled[i] release];
+        }
+        [_sharpen release];
         [_fallbackQueue release];
         [_residencySet release];
         [_residentQueues release];
@@ -432,7 +574,11 @@ static BOOL install_present_hooks(void)
             {
                 [_textures[i] release];
                 _textures[i] = nil;
+                [_upscaled[i] release];
+                _upscaled[i] = nil;
             }
+            [_sharpen release];
+            _sharpen = metalfx_sharpness > 0 ? [sharpen_pipeline(device, format) retain] : nil;
             if (_residencySet)
             {
                 [_residencySet removeAllAllocations];
@@ -556,6 +702,7 @@ static BOOL install_present_hooks(void)
         @synchronized(self)
         {
             id<MTLTexture> texture;
+            WineUpscaleDrawable* drawable;
 
             /* A window resized without a new swapchain size keeps its last
              * upscale, which Core Animation then stretches. */
@@ -578,9 +725,23 @@ static BOOL install_present_hooks(void)
                     [_residencySet commit];
                 }
             }
+            if (_sharpen && !_upscaled[_nextTexture])
+            {
+                MTLTextureDescriptor *desc = [MTLTextureDescriptor
+                    texture2DDescriptorWithPixelFormat:format
+                                                 width:_scaler.outputWidth
+                                                height:_scaler.outputHeight
+                                             mipmapped:NO];
+                desc.usage = MTLTextureUsageShaderRead | _scaler.outputTextureUsage;
+                desc.storageMode = MTLStorageModePrivate;
+                _upscaled[_nextTexture] = [device newTextureWithDescriptor:desc];
+            }
+            drawable = [[[WineUpscaleDrawable alloc] initWithLayer:self texture:texture scaler:_scaler
+                                                        drawableID:_nextTexture] autorelease];
+            if (_sharpen && _upscaled[_nextTexture])
+                [drawable sharpenInto:_upscaled[_nextTexture] with:_sharpen sharpness:metalfx_sharpness / 100.0f];
             _nextTexture = (_nextTexture + 1) % 4;
-            return [[[WineUpscaleDrawable alloc] initWithLayer:self texture:texture scaler:_scaler
-                                                    drawableID:_nextTexture] autorelease];
+            return drawable;
         }
     }
 

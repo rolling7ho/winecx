@@ -58,6 +58,7 @@ bool cursor_clipping_locks_windows = true;
 bool use_precise_scrolling = true;
 bool scroll_momentum = true;
 bool metalfx_upscale = false;
+int metalfx_sharpness = 0;
 int gl_surface_mode = GL_SURFACE_IN_FRONT_OPAQUE;
 bool retina_enabled = false;
 bool enable_app_nap = false;
@@ -381,6 +382,15 @@ static void setup_options(void)
 
     if (!get_config_key(hkey, appkey, "MetalFXUpscale", buffer, sizeof(buffer)))
         metalfx_upscale = IS_OPTION_TRUE(buffer[0]);
+
+    if (!get_config_key(hkey, appkey, "UpscaleSharpness", buffer, sizeof(buffer)))
+    {
+        const WCHAR *p;
+        metalfx_sharpness = 0;
+        for (p = buffer; *p >= '0' && *p <= '9' && metalfx_sharpness <= 100; p++)
+            metalfx_sharpness = metalfx_sharpness * 10 + (*p - '0');
+        metalfx_sharpness = min(metalfx_sharpness, 100);
+    }
 
     if (!get_config_key(hkey, appkey, "OpenGLSurfaceMode", buffer, sizeof(buffer)))
     {

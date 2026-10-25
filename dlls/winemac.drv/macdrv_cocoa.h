@@ -144,6 +144,7 @@ extern bool cursor_clipping_locks_windows;
 extern bool use_precise_scrolling;
 extern bool scroll_momentum;
 extern bool metalfx_upscale;
+extern int metalfx_sharpness;  /* 0 to 100: RCAS sharpening after the MetalFX upscale. */
 extern int gl_surface_mode;
 extern CFDictionaryRef localized_strings;
 extern bool retina_enabled;  /* Whether Retina mode is enabled via registry setting. */
