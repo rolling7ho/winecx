@@ -4458,13 +4458,73 @@ static LONG apply_display_settings( struct source *target, const DEVMODEW *devmo
     return ret;
 }
 
+/* A DPI-unaware process is told the screen is its scaled size (SM_CXSCREEN,
+ * the monitor rect), so the display modes it is told about have to match.
+ * Left in raw pixels, a game going exclusive fullscreen sizes its window to
+ * the raw mode, and that window is then scaled up again on the way to the
+ * screen, by 2 on a Retina display: the game shows a quarter of itself.
+ * The ratio maps raw mode sizes to the calling thread's; num == den when
+ * no mapping is needed. */
+static struct ratio thread_mode_scale( const struct source *source )
+{
+    struct ratio dpi = get_thread_dpi(), scale = {1, 1};
+    UINT source_dpi = source->dpi ? source->dpi : system_dpi;
+
+    if (!dpi.num || dpi.num == source_dpi * dpi.den) return scale;
+    scale.num = dpi.num;
+    scale.den = source_dpi * dpi.den;
+    return scale;
+}
+
+static void scale_devmode( DEVMODEW *devmode, struct ratio scale )
+{
+    if (scale.num == scale.den) return;
+    if (devmode->dmFields & DM_PELSWIDTH) devmode->dmPelsWidth = muldiv( devmode->dmPelsWidth, scale.num, scale.den );
+    if (devmode->dmFields & DM_PELSHEIGHT) devmode->dmPelsHeight = muldiv( devmode->dmPelsHeight, scale.num, scale.den );
+    if (devmode->dmFields & DM_POSITION)
+    {
+        devmode->dmPosition.x = muldiv( devmode->dmPosition.x, scale.num, scale.den );
+        devmode->dmPosition.y = muldiv( devmode->dmPosition.y, scale.num, scale.den );
+    }
+}
+
+/* The raw size of a mode a DPI-unaware process asked for in its own scale:
+ * the source mode that scales to it, so rounding cannot miss the mode. */
+static void unscale_devmode( const struct source *source, DEVMODEW *devmode, struct ratio scale )
+{
+    const DEVMODEW *mode;
+
+    if (scale.num == scale.den) return;
+    if ((devmode->dmFields & (DM_PELSWIDTH | DM_PELSHEIGHT)) == (DM_PELSWIDTH | DM_PELSHEIGHT))
+    {
+        for (mode = source->modes; mode && mode->dmSize; mode = NEXT_DEVMODEW(mode))
+        {
+            if (muldiv( mode->dmPelsWidth, scale.num, scale.den ) != devmode->dmPelsWidth ||
+                muldiv( mode->dmPelsHeight, scale.num, scale.den ) != devmode->dmPelsHeight)
+                continue;
+            devmode->dmPelsWidth = mode->dmPelsWidth;
+            devmode->dmPelsHeight = mode->dmPelsHeight;
+            devmode->dmFields &= ~(DM_PELSWIDTH | DM_PELSHEIGHT);
+            break;
+        }
+    }
+    if (devmode->dmFields & DM_PELSWIDTH) devmode->dmPelsWidth = muldiv( devmode->dmPelsWidth, scale.den, scale.num );
+    if (devmode->dmFields & DM_PELSHEIGHT) devmode->dmPelsHeight = muldiv( devmode->dmPelsHeight, scale.den, scale.num );
+    devmode->dmFields |= DM_PELSWIDTH | DM_PELSHEIGHT;
+    if (devmode->dmFields & DM_POSITION)
+    {
+        devmode->dmPosition.x = muldiv( devmode->dmPosition.x, scale.den, scale.num );
+        devmode->dmPosition.y = muldiv( devmode->dmPosition.y, scale.den, scale.num );
+    }
+}
+
 /***********************************************************************
  *	     NtUserChangeDisplaySettings    (win32u.@)
  */
 LONG WINAPI NtUserChangeDisplaySettings( UNICODE_STRING *devname, DEVMODEW *devmode, HWND hwnd,
                                          DWORD flags, void *lparam )
 {
-    DEVMODEW full_mode = {.dmSize = sizeof(DEVMODEW)};
+    DEVMODEW full_mode = {.dmSize = sizeof(DEVMODEW)}, requested;
     int ret = DISP_CHANGE_SUCCESSFUL;
     struct source *source;
 
@@ -4474,6 +4534,18 @@ LONG WINAPI NtUserChangeDisplaySettings( UNICODE_STRING *devname, DEVMODEW *devm
     if ((!devname || !devname->Length) && !devmode) return apply_display_settings( NULL, NULL, hwnd, flags, lparam );
 
     if (!(source = find_source( devname ))) return DISP_CHANGE_BADPARAM;
+
+    if (devmode)
+    {
+        struct ratio scale = thread_mode_scale( source );
+        if (scale.num != scale.den && devmode->dmSize >= offsetof(DEVMODEW, dmICMMethod))
+        {
+            memset( &requested, 0, sizeof(requested) );
+            memcpy( &requested, devmode, min( devmode->dmSize, sizeof(requested) ));
+            unscale_devmode( source, &requested, scale );
+            devmode = &requested;
+        }
+    }
 
     if (!source_get_full_mode( source, devmode, &full_mode )) ret = DISP_CHANGE_BADMODE;
     else if ((flags & CDS_UPDATEREGISTRY) && !source_set_registry_settings( source, &full_mode )) ret = DISP_CHANGE_NOTUPDATED;
@@ -4542,6 +4614,7 @@ BOOL WINAPI NtUserEnumDisplaySettings( UNICODE_STRING *device, DWORD index, DEVM
     else if (index == ENUM_CURRENT_SETTINGS) ret = source_get_current_settings( source, devmode );
     else if (index == WINE_ENUM_PHYSICAL_SETTINGS) ret = FALSE;
     else ret = source_enum_display_settings( source, index, devmode, flags );
+    if (ret) scale_devmode( devmode, thread_mode_scale( source ) );
     source_release( source );
 
     if (!ret) WARN( "Failed to query %s display settings.\n", debugstr_us(device) );
