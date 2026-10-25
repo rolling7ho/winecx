@@ -537,6 +537,63 @@ LONG WINAPI ChangeDisplaySettingsExA( LPCSTR devname, LPDEVMODEA devmode, HWND h
 }
 
 
+/* A DPI-unaware thread is told the screen is its scaled size (SM_CXSCREEN,
+ * the monitor rect), so the display modes it is told about have to match.
+ * Left in raw pixels, a game going exclusive fullscreen sizes its window to
+ * the raw mode, and that window is then scaled up again on the way to the
+ * screen, by 2 on a Retina display: the game shows a quarter of itself.
+ * Done here rather than in win32u, whose unix half D3DMetal patches at load
+ * and so has to stay byte for byte the shipped build. */
+static BOOL get_mode_scale( UINT *num, UINT *den )
+{
+    DEVMODEW current = {.dmSize = sizeof(current)};
+    UNICODE_STRING primary = {0};
+
+    if (GetAwarenessFromDpiAwarenessContext( GetThreadDpiAwarenessContext() ) != DPI_AWARENESS_UNAWARE)
+        return FALSE;
+    if (!NtUserEnumDisplaySettings( &primary, ENUM_CURRENT_SETTINGS, &current, 0 )) return FALSE;
+    *num = GetSystemMetrics( SM_CXSCREEN );
+    *den = current.dmPelsWidth;
+    return *num && *den && *num < *den;
+}
+
+static void scale_position( DEVMODEW *devmode, UINT num, UINT den )
+{
+    if (!(devmode->dmFields & DM_POSITION)) return;
+    devmode->dmPosition.x = MulDiv( devmode->dmPosition.x, num, den );
+    devmode->dmPosition.y = MulDiv( devmode->dmPosition.y, num, den );
+}
+
+static void scale_mode( DEVMODEW *devmode, UINT num, UINT den )
+{
+    if (devmode->dmFields & DM_PELSWIDTH) devmode->dmPelsWidth = MulDiv( devmode->dmPelsWidth, num, den );
+    if (devmode->dmFields & DM_PELSHEIGHT) devmode->dmPelsHeight = MulDiv( devmode->dmPelsHeight, num, den );
+    scale_position( devmode, num, den );
+}
+
+/* The raw mode a DPI-unaware thread asked for in its own scale: the device
+ * mode that scales to it, so rounding cannot miss the mode. */
+static void unscale_mode( UNICODE_STRING *device, DEVMODEW *devmode, UINT num, UINT den )
+{
+    DEVMODEW mode = {.dmSize = sizeof(mode)};
+    DWORD i;
+
+    if ((devmode->dmFields & (DM_PELSWIDTH | DM_PELSHEIGHT)) == (DM_PELSWIDTH | DM_PELSHEIGHT))
+    {
+        for (i = 0; NtUserEnumDisplaySettings( device, i, &mode, 0 ); i++)
+        {
+            if (MulDiv( mode.dmPelsWidth, num, den ) != devmode->dmPelsWidth ||
+                MulDiv( mode.dmPelsHeight, num, den ) != devmode->dmPelsHeight)
+                continue;
+            devmode->dmPelsWidth = mode.dmPelsWidth;
+            devmode->dmPelsHeight = mode.dmPelsHeight;
+            scale_position( devmode, den, num );
+            return;
+        }
+    }
+    scale_mode( devmode, den, num );
+}
+
 /***********************************************************************
  *		ChangeDisplaySettingsExW (USER32.@)
  */
@@ -544,7 +601,17 @@ LONG WINAPI ChangeDisplaySettingsExW( LPCWSTR devname, LPDEVMODEW devmode, HWND 
                                       DWORD flags, LPVOID lparam )
 {
     UNICODE_STRING str;
+    DEVMODEW requested;
+    UINT num, den;
+
     RtlInitUnicodeString( &str, devname );
+    if (devmode && devmode->dmSize >= FIELD_OFFSET(DEVMODEW, dmICMMethod) && get_mode_scale( &num, &den ))
+    {
+        memset( &requested, 0, sizeof(requested) );
+        memcpy( &requested, devmode, min( devmode->dmSize, sizeof(requested) ));
+        unscale_mode( &str, &requested, num, den );
+        devmode = &requested;
+    }
     return NtUserChangeDisplaySettings( &str, devmode, hwnd, flags, lparam );
 }
 
@@ -619,8 +686,12 @@ BOOL WINAPI EnumDisplaySettingsExW( const WCHAR *device, DWORD mode,
                                     DEVMODEW *dev_mode, DWORD flags )
 {
     UNICODE_STRING str;
+    UINT num, den;
+
     RtlInitUnicodeString( &str, device );
-    return NtUserEnumDisplaySettings( &str, mode, dev_mode, flags );
+    if (!NtUserEnumDisplaySettings( &str, mode, dev_mode, flags )) return FALSE;
+    if (get_mode_scale( &num, &den )) scale_mode( dev_mode, num, den );
+    return TRUE;
 }
 
 static UINT get_ntuser_dpi_context( DPI_AWARENESS_CONTEXT context )
