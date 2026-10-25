@@ -4193,6 +4193,8 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
     CAMetalLayer* offscreen_layer;
     CAContext* remote_context;
     CAContextID context_id;
+    CGRect last_container, last_frame;
+    BOOL last_retina, has_geometry;
 }
 
 - (instancetype) initWithHwnd:(void*)hwnd client:(void*)client container:(CGRect)container frame:(CGRect)frame;
@@ -4265,6 +4267,16 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
 {
     CALayer* c = container_layer;
     CAMetalLayer* o = offscreen_layer;
+
+    /* Called on every present: a frame at the same size changes nothing, and
+     * the flush below is not free. */
+    if (has_geometry && CGRectEqualToRect(container, last_container) &&
+        CGRectEqualToRect(frame, last_frame) && last_retina == retina_on)
+        return;
+    has_geometry = YES;
+    last_container = container;
+    last_frame = frame;
+    last_retina = retina_on;
 
     /* no implicit animation, a resize must land in one frame */
     [CATransaction begin];
