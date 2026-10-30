@@ -4452,6 +4452,14 @@ NTSTATUS virtual_alloc_thread_stack( INITIAL_TEB *stack, ULONG_PTR limit_low, UL
     stack->OldStackLimit = 0;
     stack->DeallocationStack = view->base;
     stack->StackBase = (char *)view->base + view->size;
+#if defined(__APPLE__) && defined(__x86_64__)
+    /* Vodka hack: PE code runs with GSBASE at the TEB, and D3DMetal runs its
+     * own unix code on PE threads without switching it back. libsystem finds
+     * errno through %gs:8, which is Tib.StackBase there, so a failed wait in
+     * D3DMetal stores errno at StackBase. Keep the top page of the view above
+     * StackBase so that store lands in memory the thread owns. */
+    stack->StackBase = (char *)stack->StackBase - host_page_size;
+#endif
     stack->StackLimit = (char *)view->base + (guard_page ? 2 * host_page_size : 0);
 done:
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
