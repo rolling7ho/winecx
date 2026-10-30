@@ -62,6 +62,7 @@ int metalfx_sharpness = 0;
 int gl_surface_mode = GL_SURFACE_IN_FRONT_OPAQUE;
 bool retina_enabled = false;
 bool enable_app_nap = false;
+bool show_dock_icon = true;
 
 pthread_key_t macdrv_thread_data_key = 0;
 UINT64 app_icon_callback = 0;
@@ -406,6 +407,17 @@ static void setup_options(void)
 
     if (!get_config_key(hkey, appkey, "EnableAppNap", buffer, sizeof(buffer)))
         enable_app_nap = IS_OPTION_TRUE(buffer[0]);
+
+    /* Steam's bootstrap stays alive with only a hidden window once its UI
+       moves to steamwebhelper.exe, so a Dock icon for it is a second, empty
+       "Steam".  Every process runs the same Mac executable, so Cocoa can't
+       tell it apart by name; decide here from the Windows image name. */
+    {
+        static const WCHAR steamW[] = {'s','t','e','a','m','.','e','x','e',0};
+        show_dock_icon = !!wcsicmp(appname, steamW);
+    }
+    if (!get_config_key(hkey, appkey, "ShowDockIcon", buffer, sizeof(buffer)))
+        show_dock_icon = IS_OPTION_TRUE(buffer[0]);
 
     /* Don't use appkey.  The DPI and monitor sizes should be consistent for all
        processes in the prefix. */

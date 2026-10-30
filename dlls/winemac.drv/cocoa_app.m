@@ -325,7 +325,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
                 });
 
                 exeName = [NSRunningApplication currentApplication].executableURL.lastPathComponent;
-                if ([blacklistedProcesses containsObject:exeName])
+                if (!show_dock_icon || [blacklistedProcesses containsObject:exeName])
                 {
                     /* Try to honor the activation request regardless. */
                     if (activateIfTransformed)
