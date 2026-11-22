@@ -1,3 +1,15 @@
+# Archived — moved to the Vodka monorepo
+
+This repository is archived. The patched source now lives in the monorepo:
+
+- https://github.com/rolling7ho/Vodka/tree/main/engine/winecx
+- tracked there as a `git subtree` (branch `d3dmetal-errno`)
+- upstream: https://github.com/dappermint/winecx
+
+Other branches here remain for history. Open issues and PRs in the monorepo.
+
+---
+
 ## INTRODUCTION
 
 Wine is a program which allows running Microsoft Windows programs
