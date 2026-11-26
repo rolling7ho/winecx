@@ -1,12 +1,11 @@
-# Archived — moved to the Vodka monorepo
+# winecx for Vodka
 
-This repository is archived. The patched source now lives in the monorepo:
+Patched Wine and CrossOver source tree from which [Vodka](https://github.com/rolling7ho/Vodka)
+builds its Windows runtimes.
 
-- https://github.com/rolling7ho/Vodka/tree/main/engine/winecx
-- tracked there as a `git subtree` (branch `d3dmetal-errno`)
-- upstream: https://github.com/dappermint/winecx
-
-Other branches here remain for history. Open issues and PRs in the monorepo.
+- Active branch: `d3dmetal-errno`
+- Application repository: https://github.com/rolling7ho/Vodka
+- Upstream repository: https://github.com/dappermint/winecx
 
 ---
 
