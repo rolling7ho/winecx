@@ -4453,7 +4453,7 @@ NTSTATUS virtual_alloc_thread_stack( INITIAL_TEB *stack, ULONG_PTR limit_low, UL
     stack->DeallocationStack = view->base;
     stack->StackBase = (char *)view->base + view->size;
 #if defined(__APPLE__) && defined(__x86_64__)
-    /* Vodka hack: PE code runs with GSBASE at the TEB, and D3DMetal runs its
+    /* Gmac hack: PE code runs with GSBASE at the TEB, and D3DMetal runs its
      * own unix code on PE threads without switching it back. libsystem finds
      * errno through %gs:8, which is Tib.StackBase there, so a failed wait in
      * D3DMetal stores errno at StackBase. Keep the top page of the view above
